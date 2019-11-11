@@ -1,41 +1,27 @@
 #!/bin/bash
 
-## TLSA-auto-update
-## Version: 20190415
+## Script for automatically changing DANE-for-web TLSA hash, after auto renewing Letsencrypt certificate
+## Execute frequency: run every hour with cron
+## Version: 20190907
 ## Author: Dennis Baaten (Baaten ICT Security)
 
-## Script for automatically changing DANE-for-web TLSA hash, after auto renewing Letsencrypt certificate
-## Execute frequency: run every hour with cron: 10 * * * * root /path/to/tlsa-auto-update > /dev/null 2>&1
-
-#### LICENSE INFORMATION
-## First version created in june 2018 by Dennis Baaten (Baaten ICT Security) 
-##
-## Licensed under the Apache License, Version 2.0 (the "License");
-## you may not use this file except in compliance with the License.
-## You may obtain a copy of the License at
-##
-##    http://www.apache.org/licenses/LICENSE-2.0
-##
-## Unless required by applicable law or agreed to in writing, software
-## distributed under the License is distributed on an "AS IS" BASIS,
-## WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-## See the License for the specific language governing permissions and
-## limitations under the License.
-
-#### ASSUMPTIONS WHILE MAKING THIS SCRIPT
-## Letsencrypt certificates are added like this: certbot certonly --webroot -w /var/www/www.example.com/ -d www.example.com -d example.com
-## There is a DANE record present in the DNS zone (from the initial setup).
+#### ASSUMPTIONS WHILE USING THIS SCRIPT
+## Letsencrypt certificates are added like this: certbot certonly --webroot -w /var/domains/www.example.com/ -d www.example.com -d example.com
 ## Using Bind as a DNS server
 ## Using OpenDNSSEC for signing zonefiles
 ## Logrotate causes apache to auto reload every 24 hours (cron.daily). Therefore I'm using custom symlinks in the letsencrypt 'live' directory
 ## Root domain and www subdomain have the same certificate
 ## Zonefile does only contain DANE hash for root domain and www subdomain
-## Default TLSA 1 1 1 is being used for all domains; being respectively the certificate usage field, the selector field, matching type field.
+## By default a "TLSA 1 1 1" record is being used for all domains; being respectively the certificate usage field, the selector field, matching type field.
 
 #### VERSION HISTORY
+## Version 20190907
+## - added support for domains that don't use DANE. For these domains only the symlink to the certificate is changed when detecting a new certificate.
+## - added certificate file checks to prevent errors.
+## - added support for an extra default certificate path (within the context of my specific setup)
 ##
 ## Version 20190415
-## - changed default to selector type "1"; use a certificates public key
+## - changed default usage to selector type 1; use a certificates public key
 ##
 ## Version 20190203
 ## - added logging to /var/log/messages and removed logging to stdout
@@ -56,23 +42,48 @@ sed -i "/www/d" /etc/letsencrypt/letsencryptdomains
 
 for domainname in $(cat /etc/letsencrypt/letsencryptdomains)
 do
+
 	#### First let's set some variables
 
 	## The current unix time (number of seconds since 1-1-1970)
         current_epoch="$(exec date '+%s')"
+
 	## The unix time of the last known modify date of the letsencrypt certificate file
-	cert_file_renewal_date="$(exec stat $(readlink -f /etc/letsencrypt/live/www.$domainname/cert.pem) | grep Modify | cut -f1 --complement -d " " | sed 's/^[ \t]*//;s/[ \t]*$//')"
-	cert_file_renewal_epoch="$(date --date="$cert_file_renewal_date" +"%s")"
-	## Set full filename path using know directory structure and zonefile naming convention
-	filename="/etc/bind/external/db.$domainname"
+	certfile="/etc/letsencrypt/live/www.$domainname/cert.pem"
+	certpath="/etc/letsencrypt/live/www.$domainname/"
+	if [ -f "$certfile" ]; then
+		cert_file_renewal_date="$(exec stat $(readlink -f /etc/letsencrypt/live/www.$domainname/cert.pem) | grep Modify | cut -f1 --complement -d " " | sed 's/^[ \t]*//;s/[ \t]*$//')"
+		cert_file_renewal_epoch="$(date --date="$cert_file_renewal_date" +"%s")"
+	else
+		certfile="/etc/letsencrypt/live/$domainname/cert.pem"
+		certpath="/etc/letsencrypt/live/$domainname/"
+		if [ -f "$certfile" ]; then
+			cert_file_renewal_date="$(exec stat $(readlink -f /etc/letsencrypt/live/$domainname/cert.pem) | grep Modify | cut -f1 --complement -d " " | sed 's/^[ \t]*//;s/[ \t]*$//')"
+                	cert_file_renewal_epoch="$(date --date="$cert_file_renewal_date" +"%s")"
+		else
+			tee >(logger) <<< "[ChangeDane] - $domainname - certificate file does not exist. exit script."
+			exit 1
+		fi
+	fi
+
+	## Set full zonefile path using know directory structure and zonefile naming convention
+	zonefile="/etc/bind/external/db.$domainname"
+
+	## Check if zonefile contains DANE records
+	daneexists=$(exec cat $zonefile | grep "_443._tcp")
+
 	## Get dane hash from zonefile
-	danezone=$(exec cat $filename | grep "_443._tcp.$domainname" | cut -d " " -f7 | xargs)
+	danezone=$(exec cat $zonefile | grep "_443._tcp.$domainname" | cut -d " " -f7 | xargs)
+
 	## Calculate dane SHA256 hash based on the public key of the Letsencrypt certificate
-	openssloutput=$(openssl x509 -in /etc/letsencrypt/live/www.$domainname/cert.pem -noout -pubkey | openssl pkey -pubin -outform DER | openssl sha256)
+	openssloutput=$(openssl x509 -in $certpath/cert.pem -noout -pubkey | openssl pkey -pubin -outform DER | openssl sha256)
+
 	## Get DANE hash from openssl output
 	danecert=$(exec echo $openssloutput | cut -f2 -d "=" | xargs)
+
 	## Get current serial from zonefile
-	currentserial=$(exec cat $filename | grep serial | cut -f1 -d ";" | xargs)
+	currentserial=$(exec cat $zonefile | grep serial | cut -f1 -d ";" | xargs)
+
 	## Create new serial using today's date and add 00 at the end
 	newserial="$(exec date +%Y%m%d)00"
 
@@ -89,53 +100,75 @@ do
 
 			## Print status to stdout
 			tee >(logger) <<< "[ChangeDane] - $domainname - DANE hash from new certificate already exists in zonefile"
+
+			## in case this is a domain where DANE is not used: change the custom symlinks for apache
         	else
-	                ## Find the lines for DANE and add a new DANE record.
-			## What I actually do: I replace the old DANE record with the old DANE record including a comment followed by a DANE record on a new line.
-			## I also only replace DANE records with certificate usage field '1'. That's how I make sure that the roll over DANE records (which have usage field '3') are left intact. 
-	                sed -i "/_443._tcp.www.$domainname. IN TLSA 1/c\_443._tcp.www.$domainname. IN TLSA 1 1 1 $danezone ; old-dane-hash\n_443._tcp.www.$domainname. IN TLSA 1 1 1 $danecert" $filename
-	                sed -i "/_443._tcp.$domainname. IN TLSA 1/c\_443._tcp.$domainname. IN TLSA 1 1 1 $danezone ; old-dane-hash\n_443._tcp.$domainname. IN TLSA 1 1 1 $danecert" $filename
+			## DANE hash of the new certificate is not found in zone file.
+			## First check if this domain is actually using a DANE record
+			if [ -z "$daneexists" ]; then
+				## There is no DANE record is the zone file.
+				## Change the custom symlinks of the certificates for apache to be able to find them
+                                ln -sf $(readlink -f $certpath/cert.pem) $certpath/custom-cert.pem
+                                ln -sf $(readlink -f $certpath/chain.pem) $certpath/custom-chain.pem
+                                ln -sf $(readlink -f $certpath/fullchain.pem) $certpath/custom-fullchain.pem
+                                ln -sf $(readlink -f $certpath/privkey.pem) $certpath/custom-privkey.pem
 
-	                ## Check whether to create new serial based on date of today, or increase current one, depending on which one is bigger
-	                if (( $newserial > $currentserial )); then
-	                        ## Replace old serial with new serial
-	                        sed -i "s/$currentserial/$newserial/g" $filename
-	                else
-	                        ## Add 1 to current serialnumber
-	                        sed -i "s/$currentserial/$((currentserial + 1))/g" $filename
-	                fi
+				## Print status to stdout
+                                tee >(logger) <<< "[ChangeDane] - $domainname - DANE not detected for this domain. Custom symlinks now point to the new certificate"
 
-			## Print status to stdout
-			tee >(logger) <<< "[ChangeDane] - $domainname - Added new DANE hash in zonefile"
-			## DNSSEC: sign the changed zone
-	                ods-signer sign $domainname
-	                ## Reload bind
-	                /etc/init.d/bind9 reload
+                                ## Reload apache to activate new certificate
+                                /etc/init.d/apache2 reload
+			else
+				## DANE record does exist in the zone file.
+				## Find the lines for current DANE record and add a new DANE record.
+				## What I actually do: I replace the old DANE record with the old DANE record including a comment followed by a DANE record on a new line.
+				## I also only replace DANE records with certificate usage field '1'. That's how I make sure that the roll over DANE records (which have usage field '3') are left intact.
+		                sed -i "/_443._tcp.www.$domainname. IN TLSA 1/c\_443._tcp.www.$domainname. IN TLSA 1 1 1 $danezone ; old-dane-hash\n_443._tcp.www.$domainname. IN TLSA 1 1 1 $danecert" $zonefile
+	        	        sed -i "/_443._tcp.$domainname. IN TLSA 1/c\_443._tcp.$domainname. IN TLSA 1 1 1 $danezone ; old-dane-hash\n_443._tcp.$domainname. IN TLSA 1 1 1 $danecert" $zonefile
+
+		                ## Check whether to create new serial based on date of today, or increase current one, depending on which one is bigger
+		                if (( $newserial > $currentserial )); then
+	        	                ## Replace old serial with new serial
+	                	        sed -i "s/$currentserial/$newserial/g" $zonefile
+		                else
+		                        ## Add 1 to current serialnumber
+	        	                sed -i "s/$currentserial/$((currentserial + 1))/g" $zonefile
+	        	        fi
+
+				## Print status to stdout
+				tee >(logger) <<< "[ChangeDane] - $domainname - Added new DANE hash in zonefile"
+				## DNSSEC: sign the changed zone
+				ods-signer sign $domainname
+	                	## Reload bind
+	                	/etc/init.d/bind9 reload
+			fi
 		fi
 	else
 		## Certificate was not renewed in the past hour (remember: this script should run every hour).
-		## Now I check if the certficate file is between 24 hours and 25 hours old. If that's the case then this means that the certificate was recently replaced and added to the DNS zone. 
-		## In my case 24 hours is more than enough time for the changed DNS zone (with the new DANE record) to spread over the internet. So after 24 hours, I activate the new certificate in apache and remove old certificate info from DNS zonefile
+		## Now I check if the certficate file is between 24 hours and 25 hours old. If that's the case then this means that the certificate was recently replaced and added to the DNS zone.
+		## In my case 24 hours is more than enough time for the changed DNS zone (with the new DANE record) to spread over the internet.
+		## So after 24 hours, I activate the new certificate in apache and remove old DANE records from DNS zonefile
+
 		if (( $current_epoch - $cert_file_renewal_epoch > 86400 )) && (( $current_epoch - $cert_file_renewal_epoch < 90000 )); then
 			## Check if the value 'old-dane-hash' exists in the zonefile
-			if grep -qF old-dane-hash $filename; then
+			if grep -qF old-dane-hash $zonefile; then
 				## Old DANE hashes exist in the zonefile; remove lines ending with the comment 'old-dane-hash'
-				sed -i "/old-dane-hash/d" $filename
+				sed -i "/old-dane-hash/d" $zonefile
 
 				## Check whether to create new serial based on date of today, or increase current one, depending on which one is bigger
         	                if (( $newserial > $currentserial )); then
 	                                ## Replace old serial with new serial
-	                                sed -i "s/$currentserial/$newserial/g" $filename
+	                                sed -i "s/$currentserial/$newserial/g" $zonefile
         	                else
                 	                ## Add 1 to current serialnumber
-                        	        sed -i "s/$currentserial/$((currentserial + 1))/g" $filename
+                        	        sed -i "s/$currentserial/$((currentserial + 1))/g" $zonefile
                         	fi
 
 				## Because I'm using custom symlinks for apache, now is the time to change the symlinks for this domain to the newest certificate files
-				ln -sf $(readlink -f /etc/letsencrypt/live/www.$domainname/cert.pem) /etc/letsencrypt/live/www.$domainname/custom-cert.pem
-				ln -sf $(readlink -f /etc/letsencrypt/live/www.$domainname/chain.pem) /etc/letsencrypt/live/www.$domainname/custom-chain.pem
-				ln -sf $(readlink -f /etc/letsencrypt/live/www.$domainname/fullchain.pem) /etc/letsencrypt/live/www.$domainname/custom-fullchain.pem
-				ln -sf $(readlink -f /etc/letsencrypt/live/www.$domainname/privkey.pem) /etc/letsencrypt/live/www.$domainname/custom-privkey.pem
+				ln -sf $(readlink -f $certpath/cert.pem) $certpath/custom-cert.pem
+                                ln -sf $(readlink -f $certpath/chain.pem) $certpath/custom-chain.pem
+                                ln -sf $(readlink -f $certpath/fullchain.pem) $certpath/custom-fullchain.pem
+                                ln -sf $(readlink -f $certpath/privkey.pem) $certpath/custom-privkey.pem
 
 				## Print status to stdout
 				tee >(logger) <<< "[ChangeDane] - $domainname - Old DANE hashes removed from zonefile, and custom symlinks now point to new certificate"
